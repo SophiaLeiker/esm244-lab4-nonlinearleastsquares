@@ -1,0 +1,110 @@
+---
+title: 'Lab 4: Nonlinear Least Squares'
+author: "Sophia Leiker"
+date: "1/28/2022"
+output: html_document
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(purrr)
+library(tidyverse)
+library(Metrics)
+library(cowplot)
+library(here)
+```
+
+## Introduction
+
+To demonstrate the power of non linear least squares in R we're going to recreate a fisheries paper that examined whether productivity in fisheries was driven more by abundance, regime shifts, or simply random noise. [Here is a link to the paper if curious about detailied methods and results](https://www.pnas.org/content/110/5/1779). In their research, they used maximum likelihood estimation rather than non-linear least squares, but we will see similar results. In fact, the model choices for nls and mle are nearly identical in selected coefficients! Also to simplify the lab, we will only recreate the abundance and random models.
+
+## Data Wrangling
+
+### Ram Legacy Database
+
+All data comes from the RAM Legacy Database, normally we would go through the whole database, but instead I have extracted out the main table containing all the values of stock parameters and a list of stocks within the cod and sole families to examine.
+
+```{r}
+timeseries_values_views<-read.csv(here("data", "timeseries_values_views"))
+
+load("/Users/sophialeiker/Desktop/Bren/2_Winter_2022/244 - Advanced Data Analysis/labs/esm244-lab4-nonlinearleastsquares/data/stock_ids.Rdata")
+
+```
+
+This table is massive, so lets clean it up. For our analysis we are only interested in the stock name, year, biomass, and catch. Select those columns and remove any observations with `N`. Let's filter out stocks with less than 20 years of data to ensure we have enough observations for the nls models to converge. I'm going to add one more step and manually remove a few stocks that I know are undesirable. Mainly they collapse, have incorrect units or are redundant for this lab.
+
+```{r}
+
+## Remove stocks with less than 20 years of data
+stock_id_clean<-timeseries_values_views %>% 
+  filter(stockid %in% stock_ids$stockid) %>%
+  select(stockid,year,TBbest,TCbest) %>% 
+  drop_na() %>% 
+  group_by(stockid) %>% 
+  summarise(diff=max(year)-min(year)) %>% 
+  filter(diff>20)
+
+remove_vec=c(1,6,9,12,19,21,22,28,42,51,52,55)  # specific known stocks I want to remove
+
+named_remove<-unique(stock_id_clean$stockid)[-remove_vec]  # Get a list of those names for filtering out
+
+Fish_data<-timeseries_values_views %>% 
+  filter(stockid %in% stock_id_clean$stockid) %>% 
+  filter(stockid %in% named_remove)
+  
+```
+
+## Single model NLS
+
+Surplus is the excess amount of biomass that was added or taken from the underlying stock. It can be modeled as a simple addition. Surplus also allows us to generally model recruitment, growth, and natural mortality that is often difficult data to collect. Stock assessements, that RAM is built on, allows us to easily back out suprlus.
+
+\begin{equation}
+S_t=B_{t+1}-B_t+C_t
+\end{equation}
+
+We will need to add a column in our dataset calculating surplus in any given year. Since we have a variable from the future we can use the `lead()` function. Make sure to drop the `NA` created by the ahead function.
+
+```{r}
+surplus<-Fish_data %>% 
+  group_by(stockid) %>% 
+  select(stockid,year,TBbest,TCbest) %>% 
+  drop_na() %>% 
+  mutate(f_biomass=lead(TBbest)) %>% 
+  mutate(surplus=f_biomass-TBbest+TCbest) %>% 
+  drop_na()
+  
+```
+
+Let's see what our data looks like with an example of one stock.
+
+```{r}
+one_stock<-surplus %>% 
+  filter(stockid=="COD1f-XIV")
+
+ggplot(data=one_stock,aes(x=year,y=surplus))+
+  geom_point(size=3,color="black")+
+  theme_minimal()
+
+```
+
+### Create a Fox Model
+
+There are three primary surplus-production models in the fishery world. The most common is the Gordon-Schaefer model. Vert-pre etal., use a Fox-Model that typically provides a more conservative estimate of maximum sustainable yield. The last model is the Pella-Tomslison model that really is just a more flexible model of the other too using a shape parameter $\phi$ to control the curve. All are built on a logistic growth curve. Given a level of biomass we will be able to predict what the surplus ought to be if we know (or will determine) the maximum sustainable yield and the carrying capacity. Maximum sustainable yield simply refers to the amount of biomass that facilitates the greatest level of harvest possible without depleting the stock. Carrying capacity is the upper bound on the total population size and represents natural environmental pressure limiting stock growth. The paper uses a simplified Fox model that we try to find parameters for to fit the fishery data.  
+
+\begin{equation}
+\hat{S_t}=-e*MSY(\frac{B_t}{K})\ln(\frac{B_t}{K})
+\end{equation}
+
+Where e is base of the natural log $\approx$ 2.718, MSY is the maximum sustainable yield, K is the carrying capacity, and $B_t$ is the biomass for the observed year.
+
+Let's create a function in R.
+
+```{r foxmodel}
+fox<-function(m,carry,biomass){
+ out= -2.718*m*(biomass/carry)*log(biomass/carry)
+return(out)
+}
+```
+
+
